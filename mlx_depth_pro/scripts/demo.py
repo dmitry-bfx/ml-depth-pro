@@ -1,270 +1,254 @@
 #!/usr/bin/env python3
-"""Depth Pro demo: PyTorch ViT + MLX C++ lib for post-ViT processing."""
+"""
+Depth Pro Demo: PyTorch ViT (MPS) + MLX C++ post-ViT
+
+Steps:
+  1. Load model and image
+  2. Run ViT encoders on MPS (patch, image, FOV)
+  3. Run post-ViT with MLX C++ lib
+  4. Run post-ViT with PyTorch (reference)
+  5. Compare outputs
+  6. Save depth map
+"""
+
+import os
+os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
 
 import argparse
 import ctypes
+import math
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torchvision.transforms import Compose, Normalize, ToTensor, ConvertImageDtype
 
-# Add project root to path for imports
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from depth_pro.network.vit_factory import create_vit, VIT_CONFIG_DICT
+from depth_pro.depth_pro import create_model_and_transforms, DEFAULT_MONODEPTH_CONFIG_DICT
 
 
-class ViTWithHooks:
-    """Wrapper to run the patch encoder and capture intermediate hook outputs."""
-
-    def __init__(self, model: nn.Module, hook_block_ids: list[int]):
-        self.model = model
-        self.hook_outputs = {}
-
-        for idx in hook_block_ids:
-            self.model.blocks[idx].register_forward_hook(
-                self._make_hook(idx)
-            )
-
-    def _make_hook(self, idx):
-        def hook_fn(module, input, output):
-            self.hook_outputs[idx] = output
-        return hook_fn
-
-    @torch.no_grad()
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        self.hook_outputs.clear()
-        return self.model(x)
-
-
-def create_pyramid(x: torch.Tensor):
-    """Create 3-level image pyramid from 1536x1536 input."""
-    x0 = x
-    x1 = F.interpolate(x, scale_factor=0.5, mode="bilinear", align_corners=False)
-    x2 = F.interpolate(x, scale_factor=0.25, mode="bilinear", align_corners=False)
-    return x0, x1, x2
-
-
-def split_patches(x: torch.Tensor, overlap_ratio: float) -> torch.Tensor:
-    """Split image into overlapping 384x384 patches with sliding window."""
-    import math
-
-    patch_size = 384
-    patch_stride = int(patch_size * (1 - overlap_ratio))
-    image_size = x.shape[-1]
-    steps = int(math.ceil((image_size - patch_size) / patch_stride)) + 1
-
-    patches = []
-    for j in range(steps):
-        j0 = j * patch_stride
-        j1 = j0 + patch_size
-        for i in range(steps):
-            i0 = i * patch_stride
-            i1 = i0 + patch_size
-            patches.append(x[..., j0:j1, i0:i1])
-
-    return torch.cat(patches, dim=0)
-
-
-def load_mlx_lib(lib_path: str):
-    """Load the MLX C++ shared library."""
-    lib = ctypes.CDLL(lib_path)
-
-    # depth_pro_mlx_create
+def load_mlx_lib(path):
+    lib = ctypes.CDLL(path)
     lib.depth_pro_mlx_create.restype = ctypes.c_void_p
     lib.depth_pro_mlx_create.argtypes = [ctypes.c_char_p]
-
-    # depth_pro_mlx_destroy
     lib.depth_pro_mlx_destroy.restype = None
     lib.depth_pro_mlx_destroy.argtypes = [ctypes.c_void_p]
-
-    # depth_pro_mlx_forward
     lib.depth_pro_mlx_forward.restype = ctypes.c_int
-    lib.depth_pro_mlx_forward.argtypes = [
-        ctypes.c_void_p,                         # model
-        ctypes.POINTER(ctypes.c_float),          # patch_enc_out
-        ctypes.POINTER(ctypes.c_float),          # hook0_out
-        ctypes.POINTER(ctypes.c_float),          # hook1_out
-        ctypes.POINTER(ctypes.c_float),          # image_enc_out
-        ctypes.POINTER(ctypes.c_float),          # fov_enc_out
-        ctypes.POINTER(ctypes.c_float),          # depth_out
-        ctypes.POINTER(ctypes.c_float),          # fov_deg_out
-    ]
-
+    lib.depth_pro_mlx_forward.argtypes = [ctypes.c_void_p] + [ctypes.POINTER(ctypes.c_float)] * 7
     return lib
 
 
-def numpy_to_cptr(arr: np.ndarray):
-    """Get a ctypes float pointer from a contiguous numpy array."""
-    arr = np.ascontiguousarray(arr, dtype=np.float32)
-    return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+def cptr(a):
+    return a.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+
+def split_patches(x, overlap_ratio):
+    patch_size = 384
+    stride = int(patch_size * (1 - overlap_ratio))
+    size = x.shape[-1]
+    steps = int(math.ceil((size - patch_size) / stride)) + 1
+    patches = []
+    for j in range(steps):
+        for i in range(steps):
+            patches.append(x[..., j*stride:j*stride+patch_size, i*stride:i*stride+patch_size])
+    return torch.cat(patches, dim=0)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Depth Pro demo with MLX backend")
-    parser.add_argument("image", help="Input image path")
-    parser.add_argument("--lib", default="./build/libdepth_pro_mlx.dylib",
-                        help="Path to MLX shared library")
-    parser.add_argument("--mlx-weights", default="./mlx_depth_pro/weights/mlx_weights.safetensors",
-                        help="Path to MLX safetensors weights")
-    parser.add_argument("--vit-weights", default="./mlx_depth_pro/weights/vit_weights.pt",
-                        help="Path to ViT PyTorch weights")
-    parser.add_argument("--output", default="depth_output.png",
-                        help="Output depth map path")
-    parser.add_argument("--device", default="mps",
-                        help="PyTorch device for ViT (mps, cpu, cuda)")
+    parser = argparse.ArgumentParser(description="Depth Pro: PyTorch ViT + MLX post-ViT")
+    parser.add_argument("image", help="Input image")
+    parser.add_argument("--output", default="depth_output.png")
+    parser.add_argument("--checkpoint", default="./checkpoints/depth_pro.pt")
+    parser.add_argument("--lib", default="./mlx_depth_pro/build/libdepth_pro_mlx.dylib")
+    parser.add_argument("--mlx-weights", default="./mlx_depth_pro/weights/mlx_weights.safetensors")
     args = parser.parse_args()
 
-    device = torch.device(args.device if torch.backends.mps.is_available() or args.device != "mps" else "cpu")
-    print(f"Using device: {device}")
+    # ================================================================
+    # 1. Load model and image
+    # ================================================================
+    print(f"Loading model from {args.checkpoint}")
+    t0 = time.perf_counter()
+    config = DEFAULT_MONODEPTH_CONFIG_DICT
+    config.checkpoint_uri = args.checkpoint
+    model, _ = create_model_and_transforms(config, device=torch.device("cpu"))
+    model.eval()
+    encoder = model.encoder
+    print(f"  Done in {time.perf_counter() - t0:.1f}s")
 
-    # --- Load ViT models ---
-    print("Loading ViT models...")
-    config = VIT_CONFIG_DICT["dinov2l16_384"]
-    hook_block_ids = config.encoder_feature_layer_ids  # [5, 11, 17, 23]
-
-    patch_encoder = create_vit("dinov2l16_384", use_pretrained=False)
-    image_encoder = create_vit("dinov2l16_384", use_pretrained=False)
-    fov_encoder = create_vit("dinov2l16_384", use_pretrained=False)
-
-    # Load ViT weights
-    vit_state = torch.load(args.vit_weights, map_location="cpu")
-
-    def load_vit_weights(model, prefix):
-        state = {}
-        for k, v in vit_state.items():
-            if k.startswith(prefix):
-                # Remove prefix to get model-relative key
-                new_key = k[len(prefix):]
-                state[new_key] = v
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        # fc_norm is only for classification head, safe to ignore
-        missing = [k for k in missing if "fc_norm" not in k]
-        if missing:
-            print(f"  Warning: missing keys for {prefix}: {missing[:5]}...")
-
-    load_vit_weights(patch_encoder, "encoder.patch_encoder.")
-    load_vit_weights(image_encoder, "encoder.image_encoder.")
-    load_vit_weights(fov_encoder, "fov.encoder.0.")
-
-    patch_encoder_hooks = ViTWithHooks(patch_encoder, hook_block_ids[:2])  # hooks on [5, 11]
-
-    patch_encoder.to(device).eval()
-    image_encoder.to(device).eval()
-    fov_encoder.to(device).eval()
-
-    # --- Load MLX lib ---
-    print("Loading MLX library...")
+    print(f"Loading MLX lib from {args.lib}")
     lib = load_mlx_lib(args.lib)
     mlx_model = lib.depth_pro_mlx_create(args.mlx_weights.encode())
     if not mlx_model:
-        print("Failed to create MLX model")
+        print("  FAILED to load MLX model")
         sys.exit(1)
+    print("  Done")
 
-    # --- Preprocess image ---
-    print("Processing image...")
     img = Image.open(args.image).convert("RGB")
     orig_w, orig_h = img.size
+    print(f"Image: {args.image} ({orig_w}x{orig_h})")
 
-    transform = Compose([
-        ToTensor(),
-        Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-        ConvertImageDtype(torch.float32),
-    ])
+    transform = Compose([ToTensor(), Normalize([0.5]*3, [0.5]*3), ConvertImageDtype(torch.float32)])
+    img_1536 = F.interpolate(transform(img).unsqueeze(0), size=(1536, 1536), mode="bilinear", align_corners=False)
 
-    img_tensor = transform(img).unsqueeze(0)  # [1, 3, H, W]
+    # ================================================================
+    # 2. Run ViT encoders on MPS
+    # ================================================================
+    device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+    print(f"\nViT device: {device}")
 
-    # Resize to 1536x1536 for the network
-    img_1536 = F.interpolate(
-        img_tensor, size=(1536, 1536), mode="bilinear", align_corners=False
-    ).to(device)
+    # Move only ViT parts to device
+    encoder.patch_encoder.to(device)
+    encoder.image_encoder.to(device)
+    model.fov.encoder[0].to(device)
 
-    # --- PyTorch: create pyramid and split ---
-    x0, x1, x2 = create_pyramid(img_1536)
+    img_dev = img_1536.to(device)
 
-    x0_patches = split_patches(x0, overlap_ratio=0.25)  # [25, 3, 384, 384]
-    x1_patches = split_patches(x1, overlap_ratio=0.5)   # [9, 3, 384, 384]
-    x2_patches = x2                                       # [1, 3, 384, 384]
+    # Pyramid + patches (cheap, on device)
+    x0, x1, x2 = img_dev, \
+        F.interpolate(img_dev, scale_factor=0.5, mode="bilinear", align_corners=False), \
+        F.interpolate(img_dev, scale_factor=0.25, mode="bilinear", align_corners=False)
+    all_patches = torch.cat([split_patches(x0, 0.25), split_patches(x1, 0.5), x2], dim=0)
+    fov_input = F.interpolate(img_dev, scale_factor=0.25, mode="bilinear", align_corners=False)
 
-    all_patches = torch.cat([x0_patches, x1_patches, x2_patches], dim=0)  # [35, 3, 384, 384]
-
-    # --- PyTorch: run ViTs ---
-    print("Running ViT encoders...")
+    print(f"Running patch encoder ({all_patches.shape[0]} patches)...", end=" ", flush=True)
+    t0 = time.perf_counter()
     with torch.no_grad():
-        # Patch encoder with hooks
-        patch_enc_out = patch_encoder_hooks(all_patches)  # [35, 577, 1024]
-        hook0_out = patch_encoder_hooks.hook_outputs[hook_block_ids[0]]  # [35, 577, 1024]
-        hook1_out = patch_encoder_hooks.hook_outputs[hook_block_ids[1]]  # [35, 577, 1024]
+        patch_enc = encoder.patch_encoder(all_patches)
+        hook0 = encoder.backbone_highres_hook0.clone()
+        hook1 = encoder.backbone_highres_hook1.clone()
+    if device.type == "mps":
+        torch.mps.synchronize()
+    print(f"{time.perf_counter() - t0:.2f}s")
 
-        # Image encoder
-        image_enc_out = image_encoder(x2_patches)  # [1, 577, 1024]
+    print(f"Running image encoder...", end=" ", flush=True)
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        image_enc = encoder.image_encoder(x2)
+    if device.type == "mps":
+        torch.mps.synchronize()
+    print(f"{time.perf_counter() - t0:.2f}s")
 
-        # FOV encoder
-        fov_input = F.interpolate(img_1536, scale_factor=0.25, mode="bilinear", align_corners=False)
-        fov_enc_out = fov_encoder(fov_input)  # [1, 577, 1024]
+    print(f"Running FOV encoder...", end=" ", flush=True)
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        fov_vit = model.fov.encoder[0](fov_input)
+    if device.type == "mps":
+        torch.mps.synchronize()
+    print(f"{time.perf_counter() - t0:.2f}s")
 
-    # Move to CPU numpy
-    patch_enc_np = patch_enc_out.cpu().float().numpy()
-    hook0_np = hook0_out.cpu().float().numpy()
-    hook1_np = hook1_out.cpu().float().numpy()
-    image_enc_np = image_enc_out.cpu().float().numpy()
-    fov_enc_np = fov_enc_out.cpu().float().numpy()
+    # Transfer to CPU for both backends
+    patch_enc = patch_enc.cpu()
+    hook0 = hook0.cpu()
+    hook1 = hook1.cpu()
+    image_enc = image_enc.cpu()
+    fov_vit = fov_vit.cpu()
 
-    # --- MLX: run post-ViT processing ---
-    print("Running MLX post-ViT processing...")
-    depth_out = np.zeros((1, 1, 1536, 1536), dtype=np.float32)
-    fov_deg_out = np.zeros(1, dtype=np.float32)
+    # ================================================================
+    # 3. Run post-ViT with MLX C++
+    # ================================================================
+    print(f"\nRunning MLX post-ViT...", end=" ", flush=True)
 
+    # Keep numpy arrays alive for the duration of the C call
+    pe_np = np.ascontiguousarray(patch_enc.numpy())
+    h0_np = np.ascontiguousarray(hook0.numpy())
+    h1_np = np.ascontiguousarray(hook1.numpy())
+    ie_np = np.ascontiguousarray(image_enc.numpy())
+    fv_np = np.ascontiguousarray(fov_vit.numpy())
+    mlx_depth = np.zeros((1, 1, 1536, 1536), dtype=np.float32)
+    mlx_fov = np.zeros(1, dtype=np.float32)
+
+    t0 = time.perf_counter()
     ret = lib.depth_pro_mlx_forward(
         mlx_model,
-        numpy_to_cptr(patch_enc_np),
-        numpy_to_cptr(hook0_np),
-        numpy_to_cptr(hook1_np),
-        numpy_to_cptr(image_enc_np),
-        numpy_to_cptr(fov_enc_np),
-        numpy_to_cptr(depth_out),
-        fov_deg_out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        cptr(pe_np), cptr(h0_np), cptr(h1_np), cptr(ie_np), cptr(fv_np),
+        cptr(mlx_depth), cptr(mlx_fov),
     )
-
+    mlx_time = time.perf_counter() - t0
     if ret != 0:
-        print("MLX forward failed")
+        print("FAILED")
         sys.exit(1)
+    print(f"{mlx_time:.2f}s")
 
-    # --- Post-process ---
-    canonical_inverse_depth = depth_out[0, 0]  # [1536, 1536]
-    fov_deg = float(fov_deg_out[0])
+    # ================================================================
+    # 4. Run post-ViT with PyTorch MPS (reference)
+    # ================================================================
+    print(f"Running PyTorch post-ViT (MPS reference)...", end=" ", flush=True)
 
-    print(f"Estimated FOV: {fov_deg:.1f} degrees")
+    model.to(device)
+    pe_dev = patch_enc.to(device)
+    h0_dev = hook0.to(device)
+    h1_dev = hook1.to(device)
+    ie_dev = image_enc.to(device)
+    img_dev2 = img_1536.to(device)
 
-    # Compute metric depth
-    f_px = 0.5 * orig_w / np.tan(0.5 * np.deg2rad(fov_deg))
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        pe_ = encoder.reshape_feature(pe_dev, encoder.out_size, encoder.out_size)
+        h0_ = encoder.reshape_feature(h0_dev, encoder.out_size, encoder.out_size)
+        h1_ = encoder.reshape_feature(h1_dev, encoder.out_size, encoder.out_size)
+        ge_ = encoder.reshape_feature(ie_dev, encoder.out_size, encoder.out_size)
+        encs = [
+            encoder.upsample_latent0(encoder.merge(h0_[:25], 1, 3)),
+            encoder.upsample_latent1(encoder.merge(h1_[:25], 1, 3)),
+            encoder.upsample0(encoder.merge(pe_[:25], 1, 3)),
+            encoder.upsample1(encoder.merge(pe_[25:34], 1, 6)),
+            encoder.fuse_lowres(torch.cat((
+                encoder.upsample2(pe_[34:]),
+                encoder.upsample_lowres(ge_)), dim=1)),
+        ]
+        features, lowres = model.decoder(encs)
+        pt_depth_tensor = model.head(features)
+        pt_fov_tensor = model.fov.forward(img_dev2, lowres.detach())
+    if device.type == "mps":
+        torch.mps.synchronize()
+    pt_time = time.perf_counter() - t0
+    print(f"{pt_time:.2f}s")
+
+    pt_depth = pt_depth_tensor.cpu().numpy()
+    pt_fov_val = float(pt_fov_tensor.cpu().numpy().flat[0])
+
+    # ================================================================
+    # 5. Compare
+    # ================================================================
+    mlx_fov_val = float(mlx_fov[0])
+    depth_diff = np.abs(mlx_depth[0, 0] - pt_depth[0, 0])
+
+    print(f"\n{'='*50}")
+    print(f"  MLX post-ViT:     {mlx_time*1000:.0f} ms")
+    print(f"  PyTorch post-ViT: {pt_time*1000:.0f} ms (MPS)")
+    print(f"  Depth max diff:   {depth_diff.max():.6e}")
+    print(f"  Depth mean diff:  {depth_diff.mean():.6e}")
+    print(f"  FOV MLX:          {mlx_fov_val:.2f} deg")
+    print(f"  FOV PyTorch:      {pt_fov_val:.2f} deg")
+    print(f"  FOV diff:         {abs(mlx_fov_val - pt_fov_val):.6e} deg")
+    match = depth_diff.max() < 0.05  # MPS has ~0.03 precision diff vs CPU/MLX
+    print(f"  Match:            {'YES' if match else 'NO'} (tol=0.05, MPS precision)")
+    print(f"{'='*50}")
+
+    # ================================================================
+    # 6. Save depth map
+    # ================================================================
+    canonical_inverse_depth = mlx_depth[0, 0]
+    f_px = 0.5 * orig_w / np.tan(0.5 * np.deg2rad(mlx_fov_val))
     inverse_depth = canonical_inverse_depth * (orig_w / f_px)
 
-    # Resize to original resolution if needed
     if orig_h != 1536 or orig_w != 1536:
-        inverse_depth_t = torch.from_numpy(inverse_depth).unsqueeze(0).unsqueeze(0)
-        inverse_depth_t = F.interpolate(
-            inverse_depth_t, size=(orig_h, orig_w), mode="bilinear", align_corners=False
-        )
-        inverse_depth = inverse_depth_t.squeeze().numpy()
+        inv_t = torch.from_numpy(inverse_depth).unsqueeze(0).unsqueeze(0)
+        inv_t = F.interpolate(inv_t, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+        inverse_depth = inv_t.squeeze().numpy()
 
     depth = 1.0 / np.clip(inverse_depth, 1e-4, 1e4)
+    depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+    Image.fromarray((depth_norm * 255).astype(np.uint8)).save(args.output)
+    print(f"\nDepth range: [{depth.min():.2f}, {depth.max():.2f}] meters")
+    print(f"Saved to {args.output}")
 
-    print(f"Depth range: [{depth.min():.2f}, {depth.max():.2f}] meters")
-
-    # Save as normalized visualization
-    depth_normalized = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
-    depth_img = Image.fromarray((depth_normalized * 255).astype(np.uint8))
-    depth_img.save(args.output)
-    print(f"Saved depth map to {args.output}")
-
-    # Cleanup
     lib.depth_pro_mlx_destroy(mlx_model)
 
 
