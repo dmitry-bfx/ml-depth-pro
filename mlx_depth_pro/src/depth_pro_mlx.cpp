@@ -1,6 +1,8 @@
 #include "depth_pro_mlx.h"
 #include "model.h"
 #include <cstring>
+#include <filesystem>
+#include "mlx/memory.h"
 
 struct DepthProMLX {
     depth_pro::DepthProModel model;
@@ -10,6 +12,11 @@ extern "C" {
 
 DepthProMLX* depth_pro_mlx_create(const char* weights_path) {
     try {
+        // MLX aborts (rather than returning error) if file doesn't exist
+        if (!std::filesystem::exists(weights_path)) {
+            fprintf(stderr, "depth_pro_mlx_create error: file not found: %s\n", weights_path);
+            return nullptr;
+        }
         auto* ctx = new DepthProMLX();
         ctx->model.load(weights_path);
         return ctx;
@@ -54,8 +61,8 @@ int depth_pro_mlx_forward(
         mx::eval(fov_deg);
 
         // depth is [1, 1536, 1536, 1] in NHWC -> copy to output as [1, 1, 1536, 1536] NCHW
-        // Transpose to NCHW first: [1, 1536, 1536, 1] -> [1, 1, 1536, 1536]
-        auto depth_nchw = mx::transpose(depth, {0, 3, 1, 2});
+        // transpose creates a non-contiguous view — must flatten/contiguous before reading
+        auto depth_nchw = mx::flatten(mx::transpose(depth, {0, 3, 1, 2}));
         mx::eval(depth_nchw);
 
         auto depth_data = depth_nchw.data<float>();
@@ -64,6 +71,9 @@ int depth_pro_mlx_forward(
         // FOV deg is [1, 1, 1, 1] -> scalar
         auto fov_data = fov_deg.data<float>();
         *fov_deg_out = fov_data[0];
+
+        // Clear Metal buffer cache to prevent memory accumulation across calls
+        mx::clear_cache();
 
         return 0;
     } catch (const std::exception& e) {
